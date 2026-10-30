@@ -1,0 +1,395 @@
+from pathlib import Path
+
+html = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,user-scalable=yes">
+<title>Grain Size Analyser</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#101827;color:#fff;font-family:Arial,sans-serif}
+header{text-align:center;padding:18px;background:#1e293b}
+h2{color:#48dfff;margin:0}
+p{color:#bdc9d8;font-size:14px;line-height:1.5}
+main{padding:12px;max-width:950px;margin:auto}
+.panel{background:#1e293b;padding:14px;border-radius:13px;margin-bottom:13px}
+input{padding:12px;border:0;border-radius:7px;font-size:16px;max-width:100%;width:100%;margin:6px 0;color:#111}
+button{border:0;border-radius:8px;padding:11px 13px;background:#078db7;color:white;font-size:14px;margin:4px 2px}
+button.active{background:#00a66b}
+button:disabled{opacity:.45}
+.delete{background:#bd3434;padding:7px 10px}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:5px}
+#stage{width:100%;height:58vh;min-height:300px;background:#080d14;border:1px solid #718096;overflow:hidden;position:relative;border-radius:8px;touch-action:none}
+canvas#canvas{display:block;width:100%;height:100%;touch-action:none}
+.stat{font-size:19px;color:#48dfff;font-weight:bold;overflow-wrap:anywhere}
+.small{font-size:12px;color:#bdc9d8}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:9px 4px;border-bottom:1px solid #435168;text-align:center}
+#magnifier{display:none;position:fixed;z-index:1000;width:150px;height:150px;border:3px solid #48dfff;border-radius:50%;background:#080d14;overflow:hidden;pointer-events:none;box-shadow:0 4px 18px #000b}
+#magnifier canvas{width:100%;height:100%;display:block}
+#magLabel{position:absolute;left:0;right:0;bottom:7px;text-align:center;font-size:10px;color:#fff;text-shadow:0 1px 3px #000}
+.note{font-size:12px;color:#9fb1c7}
+@media(min-width:700px){#magnifier{width:180px;height:180px}}
+</style>
+</head>
+<body>
+<header>
+<h2>GRAIN SIZE ANALYSER</h2>
+<p>Metallography | Linear Intercept Method<br>Version 4</p>
+</header>
+<main>
+<div class="panel">
+<b>1. Upload Microscope Image</b>
+<input type="file" id="file" accept="image/*">
+<p>Supported formats depend on your browser. JPG and PNG are recommended. For TIFF images, convert to JPG or PNG if your browser cannot display them.</p>
+</div>
+
+<div class="panel">
+<b>2. Scale Bar Calibration</b>
+<p>Enter the actual scale-bar value. Select Draw Calibration and drag from one end of the scale bar to the other. Then select Set Calibration.</p>
+<div class="row"><input id="scaleValue" type="number" value="50" min="0.001" step="any" style="flex:1"><span>µm</span></div>
+<button id="calBtn">Draw Calibration</button>
+<button id="setCalBtn">Set Calibration</button>
+<div class="stat" id="calResult">Not calibrated</div>
+</div>
+
+<div class="panel">
+<b>3. Image Controls</b>
+<p>In Move / Zoom mode, drag with one finger to move the image and use two fingers to zoom.</p>
+<button id="navBtn" class="active">Move / Zoom</button>
+<button id="plus">Zoom +</button>
+<button id="minus">Zoom −</button>
+<button id="fit">Fit Image</button>
+</div>
+
+<div class="panel">
+<b>4. Measurement Tools</b>
+<p>Drag from the test-line start point to its end point. During dragging, the magnifier above your finger shows a zoomed view with a crosshair to help position the endpoint.</p>
+<button id="lineBtn">Draw Test Line</button>
+<button id="markBtn">Mark Intersections</button>
+<button id="undoBtn">Undo</button>
+<button id="clearBtn">Clear All Lines</button>
+<p id="status">Upload a microscope image to begin.</p>
+<p class="note">Magnifier is a visual positioning aid. Measurement accuracy also depends on image resolution, calibration and correct boundary identification.</p>
+</div>
+
+<div class="panel">
+<b>5. Microscope Image</b>
+<p class="small">Calibration = Yellow | Test line = Cyan | Boundary marker = Red | Endpoint magnifier = Blue</p>
+<div id="stage"><canvas id="canvas"></canvas></div>
+</div>
+
+<div class="panel">
+<b>6. Individual Measurement Results</b>
+<div id="results">No measurements yet.</div>
+<hr>
+<p>Total test length / Total intersections</p>
+<div class="stat" id="mean">-- µm</div>
+<button id="csvBtn">Download CSV Report</button>
+<button id="pdfBtn">Download PDF Report</button>
+</div>
+</main>
+
+<div id="magnifier"><canvas id="magCanvas" width="300" height="300"></canvas><div id="magLabel">Endpoint preview</div></div>
+
+<!-- jsPDF is loaded from a CDN. An internet connection is required for PDF export. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+const canvas=document.getElementById("canvas");
+const ctx=canvas.getContext("2d");
+const stage=document.getElementById("stage");
+const mag=document.getElementById("magnifier");
+const magCanvas=document.getElementById("magCanvas");
+const magCtx=magCanvas.getContext("2d");
+const $=id=>document.getElementById(id);
+
+let img=new Image(),loaded=false,factor=null,mode="nav",calLine=null;
+let lines=[],undo=[],zoom=1,fitScale=1,offX=0,offY=0;
+let pointers=new Map(),gesture=null,drawing=null;
+const MAG_RADIUS=150, MAG_SOURCE_RADIUS=45;
+
+function say(t){$("status").textContent=t;}
+function resize(){
+ const d=window.devicePixelRatio||1;
+ canvas.width=Math.round(stage.clientWidth*d);
+ canvas.height=Math.round(stage.clientHeight*d);
+ if(loaded)fit();
+}
+function fit(){
+ if(!loaded)return;
+ fitScale=Math.min(canvas.width/img.width,canvas.height/img.height);
+ zoom=1;
+ offX=(canvas.width-img.width*fitScale)/2;
+ offY=(canvas.height-img.height*fitScale)/2;
+ render();
+}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+function render(){
+ if(!loaded)return;
+ ctx.clearRect(0,0,canvas.width,canvas.height);
+ ctx.save();
+ ctx.translate(offX,offY);
+ ctx.scale(fitScale*zoom,fitScale*zoom);
+ ctx.drawImage(img,0,0);
+ function dot(p,color,label){
+  const s=5/(fitScale*zoom);
+  ctx.fillStyle=color;ctx.beginPath();ctx.arc(p.x,p.y,s,0,Math.PI*2);ctx.fill();
+  if(label){ctx.font=(15/(fitScale*zoom))+"px Arial";ctx.fillStyle=color;ctx.fillText(label,p.x+s*1.5,p.y-s*1.5);}
+ }
+ function drawLine(a,b,color,width=2){
+  ctx.strokeStyle=color;ctx.lineWidth=width/(fitScale*zoom);
+  ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+ }
+ function label(a,b,text,color){
+  const x=(a.x+b.x)/2,y=(a.y+b.y)/2,s=12/(fitScale*zoom);
+  ctx.font="bold "+s+"px Arial";const w=ctx.measureText(text).width;
+  ctx.fillStyle="rgba(0,0,0,.78)";ctx.fillRect(x-w/2-s/3,y-s*1.4,w+s*2/3,s*1.9);
+  ctx.fillStyle=color;ctx.textAlign="center";ctx.fillText(text,x,y);ctx.textAlign="left";
+ }
+ if(calLine){
+  drawLine(calLine.a,calLine.b,"#ffe600",3);dot(calLine.a,"yellow","C1");dot(calLine.b,"yellow","C2");
+  label(calLine.a,calLine.b,factor?Number($("scaleValue").value)+" µm":dist(calLine.a,calLine.b).toFixed(1)+" px","yellow");
+ }
+ lines.forEach((l,i)=>{
+  drawLine(l.a,l.b,"#00e5ff",3);dot(l.a,"#00e5ff","");dot(l.b,"#00e5ff","");
+  const length=dist(l.a,l.b)*(factor||1);
+  label(l.a,l.b,factor?length.toFixed(2)+" µm":length.toFixed(1)+" px","#00e5ff");
+  l.hits.forEach((p,j)=>dot(p,"#ff3737",String(j+1)));
+ });
+ if(drawing){
+  drawLine(drawing.a,drawing.b,drawing.type==="cal"?"#ffe600":"#00e5ff",3);
+  dot(drawing.a,"yellow","");dot(drawing.b,drawing.bColor||"#fff","");
+  const px=dist(drawing.a,drawing.b),length=factor?px*factor:px;
+  label(drawing.a,drawing.b,factor?length.toFixed(2)+" µm":length.toFixed(1)+" px",drawing.type==="cal"?"yellow":"#00e5ff");
+ }
+ ctx.restore();
+}
+function screenToImage(e){
+ const r=canvas.getBoundingClientRect(),d=window.devicePixelRatio||1;
+ return {x:((e.clientX-r.left)*d-offX)/(fitScale*zoom),y:((e.clientY-r.top)*d-offY)/(fitScale*zoom)};
+}
+function showMagnifier(point,e){
+ if(!loaded)return;
+ const sourceRadius=MAG_SOURCE_RADIUS;
+ magCtx.clearRect(0,0,300,300);
+ magCtx.fillStyle="#080d14";magCtx.fillRect(0,0,300,300);
+ const sx=point.x-sourceRadius,sy=point.y-sourceRadius;
+ const sw=sourceRadius*2,sh=sourceRadius*2;
+ const dx=Math.max(0,sx),dy=Math.max(0,sy);
+ const right=Math.min(img.width,sx+sw),bottom=Math.min(img.height,sy+sh);
+ if(right>dx&&bottom>dy){
+  const destX=(dx-sx)/sw*300,destY=(dy-sy)/sh*300;
+  const destW=(right-dx)/sw*300,destH=(bottom-dy)/sh*300;
+  magCtx.drawImage(img,dx,dy,right-dx,bottom-dy,destX,destY,destW,destH);
+ }
+ // Fixed crosshair marks the exact endpoint at the centre of the magnified view.
+ magCtx.strokeStyle="#ffea00";magCtx.lineWidth=2;
+ magCtx.beginPath();magCtx.moveTo(150,0);magCtx.lineTo(150,300);magCtx.moveTo(0,150);magCtx.lineTo(300,150);magCtx.stroke();
+ magCtx.beginPath();magCtx.arc(150,150,8,0,Math.PI*2);magCtx.stroke();
+ const left=Math.max(8,Math.min(window.innerWidth-158,e.clientX-75));
+ const top=Math.max(8,e.clientY-172);
+ mag.style.left=left+"px";mag.style.top=top+"px";mag.style.display="block";
+}
+function hideMagnifier(){mag.style.display="none";}
+
+$("file").onchange=e=>{
+ const f=e.target.files[0];if(!f)return;
+ const url=URL.createObjectURL(f);
+ img.onload=()=>{
+  loaded=true;factor=null;calLine=null;lines=[];undo=[];drawing=null;mode="nav";
+  $("calResult").textContent="Not calibrated";hideMagnifier();resize();
+  say("Image loaded. Perform scale calibration.");URL.revokeObjectURL(url);
+ };
+ img.onerror=()=>{alert("The selected image could not be opened. Please use JPG or PNG.");URL.revokeObjectURL(url);};
+ img.src=url;
+};
+function activate(m){
+ if(!loaded){alert("Please upload a microscope image first.");return;}
+ mode=m;drawing=null;pointers.clear();hideMagnifier();
+ document.querySelectorAll("button").forEach(b=>b.classList.remove("active"));
+ const ids={nav:"navBtn",cal:"calBtn",line:"lineBtn",mark:"markBtn"};
+ if(ids[m])$(ids[m]).classList.add("active");
+ if(m==="nav")say("Move / Zoom mode active.");
+ if(m==="cal")say("Drag from one end of the scale bar to the other.");
+ if(m==="line")say("Drag from the test-line start point to its endpoint. Use the magnifier preview.");
+ if(m==="mark")say("Tap each grain-boundary intersection on a test line.");
+ render();
+}
+$("navBtn").onclick=()=>activate("nav");
+$("calBtn").onclick=()=>activate("cal");
+$("lineBtn").onclick=()=>{if(!factor){alert("Please calibrate the scale first.");return;}activate("line");};
+$("markBtn").onclick=()=>{if(!lines.length){alert("Please draw a test line first.");return;}activate("mark");};
+$("setCalBtn").onclick=()=>{
+ if(!calLine){alert("Please draw a calibration line first.");return;}
+ const actual=Number($("scaleValue").value);
+ if(!actual||actual<=0){alert("Enter a valid scale-bar value.");return;}
+ const px=dist(calLine.a,calLine.b);if(px<=0){alert("Calibration line is invalid.");return;}
+ factor=actual/px;$("calResult").textContent=factor.toFixed(6)+" µm/pixel";
+ activate("nav");say("Calibration set successfully. You can now draw test lines.");render();
+};
+function distanceToLine(p,a,b){
+ const dx=b.x-a.x,dy=b.y-a.y,d=dx*dx+dy*dy;if(!d)return Infinity;
+ const t=Math.max(0,Math.min(1,((p.x-a.x)*dx+(p.y-a.y)*dy)/d));
+ return dist(p,{x:a.x+t*dx,y:a.y+t*dy});
+}
+canvas.addEventListener("pointerdown",e=>{
+ e.preventDefault();
+ if(mode==="cal"||mode==="line"){
+  if(drawing)return;
+  canvas.setPointerCapture(e.pointerId);
+  const p=screenToImage(e);drawing={a:p,b:p,type:mode,pointer:e.pointerId};
+  showMagnifier(p,e);render();return;
+ }
+ if(mode==="mark"){
+  const p=screenToImage(e);let best=-1,min=Infinity;
+  lines.forEach((l,i)=>{const d=distanceToLine(p,l.a,l.b);if(d<min){min=d;best=i;}});
+  if(best<0||min>30){say("Tap close to a test line to add an intersection marker.");return;}
+  lines[best].hits.push(p);undo.push({type:"hit",index:best});render();update();return;
+ }
+ if(mode==="nav"){
+  pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});canvas.setPointerCapture(e.pointerId);
+  if(pointers.size===1)gesture={type:"pan",x:e.clientX,y:e.clientY,ox:offX,oy:offY};
+  if(pointers.size===2){
+   const a=[...pointers.values()],r=canvas.getBoundingClientRect(),cx=(a[0].x+a[1].x)/2,cy=(a[0].y+a[1].y)/2,d=window.devicePixelRatio||1;
+   gesture={type:"pinch",distance:Math.hypot(a[1].x-a[0].x,a[1].y-a[0].y),zoom,ix:((cx-r.left)*d-offX)/(fitScale*zoom),iy:((cy-r.top)*d-offY)/(fitScale*zoom)};
+  }
+ }
+});
+canvas.addEventListener("pointermove",e=>{
+ if(drawing&&drawing.pointer===e.pointerId){
+  drawing.b=screenToImage(e);showMagnifier(drawing.b,e);render();return;
+ }
+ if(mode!=="nav"||!pointers.has(e.pointerId))return;
+ pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+ if(pointers.size===1&&gesture?.type==="pan"){
+  const p=pointers.get(e.pointerId),d=window.devicePixelRatio||1;
+  offX=gesture.ox+(p.x-gesture.x)*d;offY=gesture.oy+(p.y-gesture.y)*d;render();
+ }
+ if(pointers.size===2&&gesture?.type==="pinch"){
+  const a=[...pointers.values()],distance=Math.hypot(a[1].x-a[0].x,a[1].y-a[0].y);
+  const newZoom=Math.max(.5,Math.min(12,gesture.zoom*distance/gesture.distance));
+  const cx=(a[0].x+a[1].x)/2,cy=(a[0].y+a[1].y)/2,r=canvas.getBoundingClientRect(),d=window.devicePixelRatio||1;
+  zoom=newZoom;offX=(cx-r.left)*d-gesture.ix*fitScale*zoom;offY=(cy-r.top)*d-gesture.iy*fitScale*zoom;render();
+ }
+});
+function pointerEnd(e){
+ if(drawing&&drawing.pointer===e.pointerId){
+  const d=dist(drawing.a,drawing.b);
+  if(d<2)say("The line is too short. Please drag again.");
+  else if(drawing.type==="cal"){
+   calLine={a:drawing.a,b:drawing.b};factor=null;
+   $("calResult").textContent="Calibration line ready. Select Set Calibration.";
+   say("Calibration line drawn. Select Set Calibration.");
+  }else{
+   lines.push({a:drawing.a,b:drawing.b,hits:[]});undo.push({type:"line"});
+   say("Test line added. Its length is shown in the results.");
+   update();
+  }
+  drawing=null;hideMagnifier();render();return;
+ }
+ if(mode==="nav"){
+  pointers.delete(e.pointerId);gesture=null;
+  if(pointers.size===1){const p=[...pointers.values()][0];gesture={type:"pan",x:p.x,y:p.y,ox:offX,oy:offY};}
+ }
+}
+canvas.addEventListener("pointerup",pointerEnd);
+canvas.addEventListener("pointercancel",pointerEnd);
+function zoomAt(z){
+ if(!loaded)return;
+ const cx=canvas.width/2,cy=canvas.height/2,ix=(cx-offX)/(fitScale*zoom),iy=(cy-offY)/(fitScale*zoom);
+ zoom=Math.max(.5,Math.min(12,z));offX=cx-ix*fitScale*zoom;offY=cy-iy*fitScale*zoom;render();
+}
+$("plus").onclick=()=>zoomAt(zoom*1.3);
+$("minus").onclick=()=>zoomAt(zoom/1.3);
+$("fit").onclick=fit;
+$("undoBtn").onclick=()=>{
+ const u=undo.pop();if(!u)return;
+ if(u.type==="line")lines.pop();if(u.type==="hit")lines[u.index]?.hits.pop();
+ render();update();
+};
+$("clearBtn").onclick=()=>{
+ if(confirm("Delete all test lines and their intersection markers?")){lines=[];undo=[];render();update();}
+};
+function deleteLine(i){lines.splice(i,1);undo=[];render();update();}
+function getTotals(){
+ let total=0,hits=0;
+ lines.forEach(l=>{total+=dist(l.a,l.b)*factor;hits+=l.hits.length;});
+ return {total,hits,mean:hits?total/hits:null};
+}
+function update(){
+ let html="<table><tr><th>Line</th><th>Length (µm)</th><th>Intersections</th><th>Mean intercept (µm)</th><th>Action</th></tr>";
+ lines.forEach((l,i)=>{
+  const length=dist(l.a,l.b)*factor,n=l.hits.length,mean=n?length/n:null;
+  html+=`<tr><td>${i+1}</td><td>${length.toFixed(2)}</td><td>${n}</td><td>${mean===null?"--":mean.toFixed(2)}</td><td><button class="delete" data-delete="${i}">Delete</button></td></tr>`;
+ });
+ html+="</table>";$("results").innerHTML=lines.length?html:"No measurements yet.";
+ const t=getTotals();$("mean").textContent=t.mean===null?"-- µm":t.mean.toFixed(3)+" µm";
+}
+$("results").addEventListener("click",e=>{
+ const btn=e.target.closest("[data-delete]");if(!btn)return;
+ const i=Number(btn.dataset.delete);if(confirm("Delete measurement line "+(i+1)+"?"))deleteLine(i);
+});
+function downloadBlob(blob,name){
+ const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=name;a.click();
+ setTimeout(()=>URL.revokeObjectURL(url),1500);
+}
+$("csvBtn").onclick=()=>{
+ if(!factor||!lines.length){alert("Calibration and at least one test line are required.");return;}
+ let csv="Line,Length_um,Intersections,Mean_intercept_um\n";
+ lines.forEach((l,i)=>{const length=dist(l.a,l.b)*factor,n=l.hits.length;csv+=`${i+1},${length.toFixed(4)},${n},${n?(length/n).toFixed(4):""}\n`;});
+ downloadBlob(new Blob([csv],{type:"text/csv;charset=utf-8"}),"Grain_Size_Report.csv");
+};
+function makeAnnotatedImage(){
+ // Export the currently displayed microscope image and all measurement overlays.
+ render();
+ return canvas.toDataURL("image/jpeg",0.92);
+}
+$("pdfBtn").onclick=()=>{
+ if(!loaded||!factor||!lines.length){alert("Upload an image, calibrate it and add at least one test line before creating a PDF report.");return;}
+ if(!window.jspdf||!window.jspdf.jsPDF){alert("PDF library could not load. Please check your internet connection and try again.");return;}
+ const {jsPDF}=window.jspdf;
+ const pdf=new jsPDF({orientation:"landscape",unit:"mm",format:"a4"});
+ const pageW=pdf.internal.pageSize.getWidth(),pageH=pdf.internal.pageSize.getHeight();
+ const totals=getTotals(),date=new Date().toLocaleString();
+ pdf.setFont("helvetica","bold");pdf.setFontSize(18);pdf.text("GRAIN SIZE ANALYSER - MEASUREMENT REPORT",14,16);
+ pdf.setFont("helvetica","normal");pdf.setFontSize(10);
+ pdf.text("Method: Linear Intercept Method",14,24);
+ pdf.text("Report date: "+date,14,30);
+ pdf.text("Calibration: "+factor.toFixed(8)+" µm/pixel",14,36);
+ pdf.text("Scale-bar value: "+$("scaleValue").value+" µm",14,42);
+ let y=52;
+ pdf.setFont("helvetica","bold");pdf.setFontSize(10);
+ pdf.text("Line",14,y);pdf.text("Length (µm)",35,y);pdf.text("Intersections",75,y);pdf.text("Mean intercept (µm)",115,y);
+ pdf.setDrawColor(120);pdf.line(14,y+2,180,y+2);
+ pdf.setFont("helvetica","normal");y+=9;
+ lines.forEach((l,i)=>{
+  const length=dist(l.a,l.b)*factor,n=l.hits.length,mean=n?length/n:"N/A";
+  pdf.text(String(i+1),14,y);pdf.text(length.toFixed(3),35,y);pdf.text(String(n),75,y);
+  pdf.text(typeof mean==="number"?mean.toFixed(3):mean,115,y);y+=7;
+  if(y>pageH-30){pdf.addPage();y=20;}
+ });
+ y+=3;pdf.setFont("helvetica","bold");
+ pdf.text("Total test length: "+totals.total.toFixed(3)+" µm",14,y);y+=7;
+ pdf.text("Total intersections: "+totals.hits,14,y);y+=7;
+ pdf.text("Overall mean lineal intercept: "+(totals.mean===null?"N/A":totals.mean.toFixed(4)+" µm"),14,y);
+ // Add the image with the test lines and intersection markers.
+ const imageData=makeAnnotatedImage();
+ const props=pdf.getImageProperties(imageData);
+ const maxW=pageW-28,maxH=pageH-30;
+ let w=maxW,h=w*props.height/props.width;
+ if(h>maxH){h=maxH;w=h*props.width/props.height;}
+ pdf.addPage("a4","landscape");
+ pdf.setFont("helvetica","bold");pdf.setFontSize(14);pdf.text("Annotated Microscope Image",14,16);
+ pdf.addImage(imageData,"JPEG",14,23,w,h,undefined,"FAST");
+ pdf.save("Grain_Size_Analyser_Report.pdf");
+};
+window.addEventListener("resize",resize);
+resize();
+</script>
+</body>
+</html>'''
+
+path = Path("/mnt/data/grain_size_analyser_v4.html")
+path.write_text(html, encoding="utf-8")
+print(f"Created: {path} ({path.stat().st_size:,} bytes)")
